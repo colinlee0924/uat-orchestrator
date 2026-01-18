@@ -1,0 +1,98 @@
+# OURS AAIF Agent Catalog
+# =======================
+# This file defines the Expert Agents available in the AAIF platform.
+# The Orchestrator loads this configuration to:
+# 1. Build delegation tools for each active agent
+# 2. Perform rule-based routing using keywords and patterns
+#
+# Each agent must be accessible via A2A protocol at the specified URL.
+# Use `mask init` to create new Expert Agents.
+
+agents:
+  # HR Expert - handles HR-related queries
+  - name: hr-expert
+    url: http://localhost:10001
+    description: "處理人資相關問題，包括請假、薪資、出勤、福利等"
+    tags: [hr, leave, salary, attendance]
+    routing_rules:
+      keywords:
+        - hr
+        - 請假
+        - 薪資
+        - 人資
+        - 出勤
+        - 假單
+        - 特休
+        - 病假
+        - 事假
+        - 加班
+        - 打卡
+        - 福利
+      patterns:
+        - ".*假.*"
+        - ".*薪.*"
+        - ".*出勤.*"
+      priority: 10
+    owner: hr-team
+    status: active
+
+  # Finance Expert - handles finance and expense queries
+  - name: finance-expert
+    url: http://localhost:10002
+    description: "處理財務報帳問題，包括費用申請、發票、報銷等"
+    tags: [finance, expense, reimbursement, invoice]
+    routing_rules:
+      keywords:
+        - 報帳
+        - 費用
+        - 發票
+        - 財務
+        - 報銷
+        - 請款
+        - 付款
+        - 預算
+        - 核銷
+      patterns:
+        - ".*報.*帳.*"
+        - ".*發票.*"
+        - ".*費用.*"
+      priority: 10
+    owner: finance-team
+    status: active
+
+  # IT Support Expert - handles IT and technical support
+  - name: it-support
+    url: http://localhost:10003
+    description: "處理 IT 技術支援問題，包括電腦故障、帳號權限、軟體安裝等"
+    tags: [it, support, technical, helpdesk]
+    routing_rules:
+      keywords:
+        - 電腦
+        - 帳號
+        - 密碼
+        - 權限
+        - VPN
+        - 網路
+        - 印表機
+        - 軟體
+        - 安裝
+        - IT
+      patterns:
+        - ".*電腦.*"
+        - ".*帳號.*"
+        - ".*權限.*"
+      priority: 8
+    owner: it-team
+    status: inactive  # Enable when ready
+
+  # General Assistant - fallback for unmatched queries
+  - name: general-assistant
+    url: http://localhost:10099
+    description: "通用助理，處理一般性問題"
+    tags: [general, assistant, fallback]
+    routing_rules:
+      keywords: []
+      patterns: []
+      priority: 0
+    owner: platform-team
+    status: inactive  # Orchestrator handles general queries directly
