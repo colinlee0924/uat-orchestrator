@@ -23,7 +23,7 @@ from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCapabilities, AgentCard, AgentSkill
 
-from mask.observability import setup_openinference_tracing
+from mask.observability import setup_dual_tracing
 
 from ours_aaif_orchestrator.agent import OrchestratorAgent
 from ours_aaif_orchestrator.executor import create_orchestrator_executor
@@ -88,9 +88,9 @@ def main() -> None:
     setup_logging()
     logger = logging.getLogger(__name__)
 
-    # Setup tracing
-    project_name = os.environ.get("PHOENIX_PROJECT_NAME", "ours-orchestrator")
-    setup_openinference_tracing(project_name=project_name)
+    # Setup tracing (supports both Phoenix and Langfuse if credentials configured)
+    project_name = os.environ.get("PHOENIX_PROJECT_NAME", "ours-aaif")
+    setup_dual_tracing(project_name=project_name)
 
     # Configuration
     host = os.environ.get("ORCHESTRATOR_HOST", "0.0.0.0")
