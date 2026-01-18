@@ -41,9 +41,13 @@ from a2a.types import (
     Part,
     Role,
 )
+from opentelemetry import trace
 
 from mask.a2a.executor import MaskAgentExecutor, _create_text_artifact
 from mask.core.state import HandoffContext
+
+# Get tracer for parameter routing spans
+tracer = trace.get_tracer(__name__)
 
 if TYPE_CHECKING:
     from ours_aaif_orchestrator.agent import OrchestratorAgent
@@ -148,61 +152,108 @@ class OrchestratorExecutor(MaskAgentExecutor):
             target_agent,
         )
 
-        # Emit "delegating" status
-        await self._emit_status(
-            event_queue=event_queue,
-            context_id=context_id,
-            task_id=task_id,
-            text=f"📤 Delegating to {target_agent}...",
-        )
-
-        try:
-            # Use native SDK via DelegationToolFactory
-            delegation_factory = self._orchestrator.delegation_factory
-            if not delegation_factory:
-                await self._emit_error(
-                    event_queue, context_id, task_id,
-                    "DelegationFactory not initialized"
-                )
-                return
-
-            # Send message using native SDK (this is reliable in uvicorn)
-            result = await delegation_factory.send_message_direct(
-                agent_name=target_agent,
-                message=message,
-                context_id=context_id,
-                task_id=task_id,
-            )
-
-            logger.info(
-                "Direct delegation to '%s' completed, response length: %d",
-                target_agent,
-                len(result) if result else 0,
-            )
-
-            # Emit result as artifact
-            await self._emit_text_artifact(
-                event_queue=event_queue,
-                context_id=context_id,
-                task_id=task_id,
-                text=result,
-            )
-
-            # Emit completion status
+        # Create a traced span for parameter routing
+        # Note: We don't use context=Context() as it breaks Phoenix output display
+        # Instead, use langfuse.trace.* attributes to set trace-level info in Langfuse
+        with tracer.start_as_current_span(
+            "ours-orchestrator",
+            attributes={
+                # OpenInference attributes (Phoenix)
+                "openinference.span.kind": "AGENT",
+                "input.value": message,
+                # Langfuse trace-level attributes (overrides root trace display)
+                "langfuse.trace.name": "ours-orchestrator",
+                "langfuse.trace.input": message,
+                # Langfuse span-level attributes
+                "name": "ours-orchestrator",
+                "metadata": f'{{"routing_type": "parameter", "target_agent": "{target_agent}"}}',
+                # Custom routing attributes
+                "routing.type": "parameter",
+                "routing.target_agent": target_agent,
+            },
+        ) as span:
+            # Emit "delegating" status
             await self._emit_status(
                 event_queue=event_queue,
                 context_id=context_id,
                 task_id=task_id,
-                text=f"✅ {target_agent} completed",
-                final=True,
+                text=f"📤 Delegating to {target_agent}...",
             )
 
-        except Exception as e:
-            logger.error("Direct delegation failed: %s", e)
-            await self._emit_error(
-                event_queue, context_id, task_id,
-                f"Delegation to {target_agent} failed: {e}"
-            )
+            try:
+                # Use native SDK via DelegationToolFactory
+                delegation_factory = self._orchestrator.delegation_factory
+                if not delegation_factory:
+                    span.set_attribute("error", True)
+                    span.set_attribute("error.message", "DelegationFactory not initialized")
+                    await self._emit_error(
+                        event_queue, context_id, task_id,
+                        "DelegationFactory not initialized"
+                    )
+                    return
+
+                # Create child span for the actual delegation call
+                with tracer.start_as_current_span(
+                    f"delegate_to_{target_agent}",
+                    attributes={
+                        # OpenInference attributes (Phoenix)
+                        "openinference.span.kind": "TOOL",
+                        "tool.name": f"delegate_to_{target_agent}",
+                        "tool.parameters": message,
+                        # Langfuse-compatible attributes
+                        "name": f"delegate_to_{target_agent}",
+                        "input": message,
+                    },
+                ) as delegation_span:
+                    # Send message using native SDK (this is reliable in uvicorn)
+                    result = await delegation_factory.send_message_direct(
+                        agent_name=target_agent,
+                        message=message,
+                        context_id=context_id,
+                        task_id=task_id,
+                    )
+                    # Set output using OpenInference semantic convention
+                    # Only set output.value (not output) - Phoenix expects nested structure
+                    delegation_span.set_attribute("output.value", result or "")
+
+                logger.info(
+                    "Direct delegation to '%s' completed, response length: %d",
+                    target_agent,
+                    len(result) if result else 0,
+                )
+
+                # Set output using OpenInference semantic convention
+                # Only set output.value (not output) - Phoenix expects nested structure
+                span.set_attribute("output.value", result or "")
+                # Langfuse trace-level output (uses different attribute)
+                span.set_attribute("langfuse.trace.output", result or "")
+
+                # Emit result as artifact
+                await self._emit_text_artifact(
+                    event_queue=event_queue,
+                    context_id=context_id,
+                    task_id=task_id,
+                    text=result,
+                )
+
+                # Emit completion status
+                await self._emit_status(
+                    event_queue=event_queue,
+                    context_id=context_id,
+                    task_id=task_id,
+                    text=f"✅ {target_agent} completed",
+                    final=True,
+                )
+
+            except Exception as e:
+                logger.error("Direct delegation failed: %s", e)
+                span.set_attribute("error", True)
+                span.set_attribute("error.message", str(e))
+                span.record_exception(e)
+                await self._emit_error(
+                    event_queue, context_id, task_id,
+                    f"Delegation to {target_agent} failed: {e}"
+                )
 
     async def _emit_status(
         self,
