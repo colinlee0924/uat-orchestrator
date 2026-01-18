@@ -38,13 +38,14 @@ from a2a.types import (
     TaskStatus,
     TaskStatusUpdateEvent,
     Message,
-    Part,
     Role,
+    TextPart,
 )
 from opentelemetry import trace
 
 from mask.a2a.executor import MaskAgentExecutor, _create_text_artifact
 from mask.core.state import HandoffContext
+from mask.observability.attributes import set_span_session, set_span_io
 
 # Get tracer for parameter routing spans
 tracer = trace.get_tracer(__name__)
@@ -146,10 +147,14 @@ class OrchestratorExecutor(MaskAgentExecutor):
         context_id = self._extract_context_id(context) or str(uuid.uuid4())
         task_id = self._extract_task_id(context) or str(uuid.uuid4())
 
+        # Extract session_id for trace grouping (uses context_id as session identifier)
+        session_id = self._extract_session_id(context)
+
         logger.debug(
-            "Direct delegation (native SDK): message='%s...', target='%s'",
+            "Direct delegation (native SDK): message='%s...', target='%s', session='%s'",
             message[:50] if len(message) > 50 else message,
             target_agent,
+            session_id or "none",
         )
 
         # Create a traced span for parameter routing
@@ -172,12 +177,21 @@ class OrchestratorExecutor(MaskAgentExecutor):
                 "routing.target_agent": target_agent,
             },
         ) as span:
-            # Emit "delegating" status
+            # Set session ID for trace grouping (Phoenix + Langfuse)
+            if session_id:
+                set_span_session(
+                    span,
+                    session_id=session_id,
+                    trace_name="ours-orchestrator",
+                )
+                logger.info("[TRACING] Set session.id: %s", session_id)
+            # Emit "delegating" status (internal event, will be filtered by pipe)
             await self._emit_status(
                 event_queue=event_queue,
                 context_id=context_id,
                 task_id=task_id,
                 text=f"📤 Delegating to {target_agent}...",
+                event_type="agent_start",  # Internal event for filtering
             )
 
             try:
@@ -205,13 +219,29 @@ class OrchestratorExecutor(MaskAgentExecutor):
                         "input": message,
                     },
                 ) as delegation_span:
-                    # Send message using native SDK (this is reliable in uvicorn)
-                    result = await delegation_factory.send_message_direct(
+                    # Set context IDs for event propagation
+                    delegation_factory.context_id = context_id
+                    delegation_factory.task_id = task_id
+                    delegation_factory.event_queue = event_queue
+
+                    # Use streaming delegation to propagate sub-agent events
+                    result = None
+                    async for event_type, event_data in delegation_factory.send_message_streaming(
                         agent_name=target_agent,
                         message=message,
                         context_id=context_id,
-                        task_id=task_id,
-                    )
+                    ):
+                        # Events are automatically propagated to event_queue by delegation_factory
+                        # We just need to capture the final result
+                        if event_type == "final_text":
+                            result = event_data
+                        elif event_type == "error":
+                            result = f"Error: {event_data}"
+
+                    # Fallback if no final_text was received
+                    if result is None:
+                        result = "No response received"
+
                     # Set output using OpenInference semantic convention
                     # Only set output.value (not output) - Phoenix expects nested structure
                     delegation_span.set_attribute("output.value", result or "")
@@ -236,13 +266,14 @@ class OrchestratorExecutor(MaskAgentExecutor):
                     text=result,
                 )
 
-                # Emit completion status
+                # Emit completion status (internal event, will be filtered by pipe)
                 await self._emit_status(
                     event_queue=event_queue,
                     context_id=context_id,
                     task_id=task_id,
                     text=f"✅ {target_agent} completed",
                     final=True,
+                    event_type="agent_end",  # Internal event for filtering
                 )
 
             except Exception as e:
@@ -262,8 +293,12 @@ class OrchestratorExecutor(MaskAgentExecutor):
         task_id: str,
         text: str,
         final: bool = False,
+        event_type: str = "agent_status",
     ) -> None:
-        """Emit a status update event.
+        """Emit a status update event with metadata for filtering.
+
+        Uses TextPart.metadata to indicate this is an internal event that
+        can be filtered by clients (e.g., Open WebUI pipe function).
 
         Args:
             event_queue: A2A event queue
@@ -271,7 +306,18 @@ class OrchestratorExecutor(MaskAgentExecutor):
             task_id: A2A task ID
             text: Status text to display
             final: Whether this is the final status
+            event_type: Event type for filtering (default: "agent_status")
         """
+        # Use TextPart with metadata for proper filtering
+        part = TextPart(
+            text=text,
+            metadata={
+                "event_type": event_type,
+                "agent_name": self.server_name,
+                "is_internal": True,  # Mark as internal for filtering
+            },
+        )
+
         await event_queue.enqueue_event(
             TaskStatusUpdateEvent(
                 contextId=context_id,
@@ -282,7 +328,7 @@ class OrchestratorExecutor(MaskAgentExecutor):
                     message=Message(
                         messageId=str(uuid.uuid4()),
                         role=Role.agent,
-                        parts=[Part(root={"text": text})],
+                        parts=[part],
                     ),
                 ),
             )
